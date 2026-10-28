@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:hop_talk/core/utils/constants/colors.dart';
 
 class SubmitButton extends StatelessWidget {
-  const new({super.key, required this.title,this.color = AppColors.primary, required this.callback});
+  const SubmitButton({super.key, required this.title,this.color = AppColors.primary, required this.callback});
 
   final String title;
   final Color color;

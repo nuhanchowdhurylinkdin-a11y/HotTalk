@@ -10,7 +10,7 @@ import 'package:hop_talk/features/onboarding/views/widgets/onboard_2_chip.dart';
 import 'package:hop_talk/features/onboarding/views/widgets/onboard_3_chip.dart';
 
 class OnboardingScreen extends GetView<OnboardingController> {
-  const new({super.key});
+  const OnboardingScreen({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -145,7 +145,7 @@ class OnboardingScreen extends GetView<OnboardingController> {
               ),
 
               TextButton(
-                onPressed: () {},
+                onPressed: controller.skipAction,
                 child: Text('SKIP', style: TextStyle(color: Color(0xFF767964))),
               ),
             ],

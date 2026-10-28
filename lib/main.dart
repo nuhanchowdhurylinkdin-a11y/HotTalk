@@ -1,34 +1,43 @@
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
+import 'package:hive_flutter/hive_flutter.dart';
+import 'package:hop_talk/core/services/storage_service.dart';
+import 'package:hop_talk/features/setup/models/user_profile.dart';
 import 'package:hop_talk/routes/app_routes.dart';
 import 'package:hop_talk/core/utils/bindings/controller_binder.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await StorageService.init();
+  await Hive.initFlutter();
+  Hive.registerAdapter(UserProfileAdapter());
+  await Hive.openBox<UserProfile>('userProfileBox');
+
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
+    final isOnboardingComplete = StorageService.isOnboardingComplete;
+    final isSetupComplete = StorageService.isSetupComplete;
+    return GetMaterialApp(
+      title: 'HopTalk',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-        fontFamily: 'Inter'
+        colorScheme: ColorScheme.fromSeed(seedColor: Colors.deepPurple),
+        fontFamily: 'Inter',
       ),
-      
-      builder: (_, child) {
-        return GetMaterialApp(
-          debugShowCheckedModeBanner: false,
-          initialRoute: AppRoutes.onboardingScreen,
-          getPages: AppRoutes.routes,
-          initialBinding: ControllerBinder(),
-        );
-      },
+      initialRoute: !isOnboardingComplete
+      ? AppRoutes.onboardingScreen
+      : !isSetupComplete
+          ? AppRoutes.setupScreen
+          : AppRoutes.homeScreen,
+      getPages: AppRoutes.routes,
+      initialBinding: ControllerBinder(),
     );
   }
 }
-

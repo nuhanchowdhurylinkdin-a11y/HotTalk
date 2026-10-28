@@ -4,7 +4,7 @@ import 'package:hop_talk/core/utils/constants/colors.dart';
 import 'package:hop_talk/features/onboarding/views/widgets/onboarding_chip.dart';
 
 class Onboard2Chip extends StatelessWidget {
-  const new({super.key});
+  const Onboard2Chip({super.key});
 
   @override
   Widget build(BuildContext context) {
