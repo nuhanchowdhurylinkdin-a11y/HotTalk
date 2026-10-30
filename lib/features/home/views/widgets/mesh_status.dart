@@ -1,7 +1,13 @@
 import 'package:flutter/material.dart';
 
 class MeshStatus extends StatelessWidget {
-  const MeshStatus({super.key});
+  const MeshStatus({super.key,
+    this.dotColor = Colors.blue,
+    required this.text
+  });
+
+  final Color dotColor;
+  final String text;
 
   @override
   Widget build(BuildContext context) {
@@ -22,14 +28,14 @@ class MeshStatus extends StatelessWidget {
             width: 7,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: Colors.blue,
+              color: dotColor,
             ),
           ),
 
           SizedBox(width: 5,),
 
           Text(
-            "Mesh Active",
+            text,
             style: TextStyle(
               fontSize: 13,
               fontWeight: FontWeight.w500,

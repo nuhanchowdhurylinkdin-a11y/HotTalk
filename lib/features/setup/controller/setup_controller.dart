@@ -139,7 +139,7 @@ class SetupController extends GetxController {
       name.value = enteredName;
 
       StorageService.setSetupComplete(true);
-      Get.offAllNamed(AppRoutes.homeScreen);
+      Get.offAllNamed(AppRoutes.permissionScreen);
 
       AppHelpers.showSuccessSnackbar(
         title: 'Success',
