@@ -1,6 +1,8 @@
+import 'dart:async';
 import 'dart:convert';
-import 'dart:typed_data';
 
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:get/get.dart';
 import 'package:hop_talk/features/home/controller/home_controller.dart';
@@ -11,12 +13,6 @@ import 'package:permission_handler/permission_handler.dart';
 import '../models/route_entry.dart';
 
 class MeshNetworkController extends GetxController {
-  @override
-  void onInit() {
-    checkAndRequestPermissions();
-    super.onInit();
-  }
-
   HomeController get _homeController => Get.find<HomeController>();
 
   late final _currentUserId = _homeController.userProfileData.value!.userId;
@@ -29,7 +25,6 @@ class MeshNetworkController extends GetxController {
   var isAdvertising = false.obs;
   var isDiscovering = false.obs;
 
-  // Individual permission states
   var bluetoothScanGranted = false.obs;
   var bluetoothAdvertiseGranted = false.obs;
   var bluetoothConnectGranted = false.obs;
@@ -37,39 +32,89 @@ class MeshNetworkController extends GetxController {
   var nearbyWifiGranted = false.obs;
   var batteryOptimizationDisabled = false.obs;
 
-  var connectedEndpoints = <String, String>{}.obs; // connected devices
-  var discoveredDevices = <String, String>{}.obs; // discovered devices
-  var blockedDevices = <String>[].obs; // blocked devices
+  var connectedEndpoints = <String, String>{}.obs; // endpointId -> user name
+  var discoveredDevices = <String, String>{}.obs; // endpointId -> user name
+  var blockedDevices = <String>[].obs; // blocked userIds
+  var knownUsers = <String, String>{}.obs; // userId -> user name
+  var chatMessages = <Map<String, dynamic>>[].obs;
 
-  final Set<String> _processedMessageIds = {}; // cached message
+  void Function(Map<String, dynamic> message)? onMessageReceived;
+
+  final Set<String> _processedMessageIds = {};
   final int _maxCacheSize = 200;
 
-  final Map<String, RouteEntry> routingTable =
-      {}; // Routing table as like phonebook
+  final Map<String, RouteEntry> routingTable = {};
+
+  final Set<String> _pendingEndpoints = {};
+  final Map<String, int> _retryCounts = {};
+  final Map<String, String> _endpointUserIds = {};
+  final Map<String, String> _endpointNames = {};
+
+  final int _defaultTtl = 16;
+  final int _maxHops = 16;
+  final int _maxPayloadBytes = 32 * 1024;
+  final int _maxConnectionRetries = 3;
+  final int _fallbackConnectDelaySeconds = 6;
+  final int _routeRefreshSeconds = 30;
+  final int _maxEndpointNameLength = 20;
+
+  int _messageCounter = 0;
+  int? _sdkInt;
+  Timer? _routeRefreshTimer;
+
+  Future<void> initMeshNetwork() async {
+    bool hasPermission = await checkAndRequestPermissions();
+    if (hasPermission) {
+      await Nearby().stopAdvertising();
+      await Nearby().stopDiscovery();
+      await Nearby().stopAllEndpoints();
+
+      _resetState();
+
+      await Future.delayed(Duration(milliseconds: 500));
+
+      routingTable[_currentUserId] = RouteEntry(
+        destinationId: _currentUserId,
+        nextHopId: 'SELF',
+        hopCount: 0,
+      );
+
+      await startMeshNode(_userName);
+      _startRouteRefresh();
+    } else {
+      Get.snackbar(
+        "Permission Required",
+        "Bluetooth, Location & Nearby permissions are required for offline mesh.",
+      );
+    }
+  }
 
   Future<bool> checkAndRequestPermissions() async {
-    bluetoothScanGranted.value = await Permission.bluetoothScan.isGranted;
-    bluetoothAdvertiseGranted.value =
-        await Permission.bluetoothAdvertise.isGranted;
-    bluetoothConnectGranted.value = await Permission.bluetoothConnect.isGranted;
-    locationGranted.value = await Permission.location.isGranted;
+    await _refreshPermissionStates();
 
-    var nearbyWifiStatus = await Permission.nearbyWifiDevices.status;
-    if (nearbyWifiStatus == PermissionStatus.permanentlyDenied ||
-        nearbyWifiStatus == PermissionStatus.restricted) {
-      nearbyWifiGranted.value = true;
-    } else {
-      nearbyWifiGranted.value = await Permission.nearbyWifiDevices.isGranted;
+    final int sdk = await _getSdkInt();
+    final List<Permission> missing = [];
+    if (!bluetoothScanGranted.value) missing.add(Permission.bluetoothScan);
+    if (!bluetoothAdvertiseGranted.value) {
+      missing.add(Permission.bluetoothAdvertise);
+    }
+    if (!bluetoothConnectGranted.value) {
+      missing.add(Permission.bluetoothConnect);
+    }
+    if (!locationGranted.value) missing.add(Permission.location);
+    if (sdk >= 33 && !nearbyWifiGranted.value) {
+      missing.add(Permission.nearbyWifiDevices);
     }
 
-    batteryOptimizationDisabled.value =
-        await Permission.ignoreBatteryOptimizations.isGranted;
+    if (missing.isNotEmpty) {
+      await missing.request();
+    }
 
-    bool allGranted =
-        bluetoothScanGranted.value &&
-        bluetoothAdvertiseGranted.value &&
-        bluetoothConnectGranted.value &&
-        locationGranted.value;
+    bool allGranted = await _refreshPermissionStates();
+    if (!allGranted) {
+      isPermissionsGranted.value = false;
+      return false;
+    }
 
     loc.Location locationService = loc.Location();
 
@@ -82,16 +127,243 @@ class MeshNetworkController extends GetxController {
       }
     }
 
+    isPermissionsGranted.value = true;
+    return true;
+  }
+
+  Future<bool> checkPermissions() async {
+    bool allGranted = await _refreshPermissionStates();
+    bool isGpsEnabled = await loc.Location().serviceEnabled();
     isPermissionsGranted.value = allGranted && isGpsEnabled;
     return isPermissionsGranted.value;
   }
 
-  void _addDirectNeighbor(String endpointId, String userId) {
-    routingTable[userId] = RouteEntry(
-      destinationId: userId,
-      nextHopId: endpointId,
-      hopCount: 1,
-    );
+  Future<bool> _refreshPermissionStates() async {
+    final int sdk = await _getSdkInt();
+    final bool needsNewBluetooth = sdk >= 31;
+    final bool needsNearbyWifi = sdk >= 33;
+
+    bluetoothScanGranted.value =
+        !needsNewBluetooth || await Permission.bluetoothScan.isGranted;
+    bluetoothAdvertiseGranted.value =
+        !needsNewBluetooth || await Permission.bluetoothAdvertise.isGranted;
+    bluetoothConnectGranted.value =
+        !needsNewBluetooth || await Permission.bluetoothConnect.isGranted;
+    locationGranted.value = await Permission.location.isGranted;
+    nearbyWifiGranted.value =
+        !needsNearbyWifi || await Permission.nearbyWifiDevices.isGranted;
+
+    batteryOptimizationDisabled.value =
+        await Permission.ignoreBatteryOptimizations.isGranted;
+
+    return bluetoothScanGranted.value &&
+        bluetoothAdvertiseGranted.value &&
+        bluetoothConnectGranted.value &&
+        locationGranted.value &&
+        nearbyWifiGranted.value;
+  }
+
+  Future<int> _getSdkInt() async {
+    if (_sdkInt != null) return _sdkInt!;
+    try {
+      final info = await DeviceInfoPlugin().androidInfo;
+      _sdkInt = info.version.sdkInt;
+    } catch (e) {
+      _sdkInt = 33;
+    }
+    return _sdkInt!;
+  }
+
+  Future<void> startMeshNode(String localUserName) async {
+    await startAdvertising(localUserName);
+    await startDiscovery(localUserName);
+  }
+
+  Future<void> startAdvertising(String userName) async {
+    try {
+      bool result = await Nearby().startAdvertising(
+        _encodeEndpointName(userName),
+        strategy,
+        serviceId: serviceId,
+        onConnectionInitiated: (String endpointId, ConnectionInfo info) {
+          _onConnectionInitiated(endpointId, info);
+        },
+        onConnectionResult: (String endpointId, Status status) {
+          _onConnectionResult(endpointId, status);
+        },
+        onDisconnected: (String endpointId) {
+          _onDisconnected(endpointId);
+        },
+      );
+      isAdvertising.value = result;
+    } catch (e) {
+      _log("Error starting advertising: $e");
+    }
+  }
+
+  Future<void> startDiscovery(String userName) async {
+    try {
+      bool result = await Nearby().startDiscovery(
+        _encodeEndpointName(userName),
+        strategy,
+        serviceId: serviceId,
+        onEndpointFound: (String endpointId, String name, String serviceId) {
+          final parsed = _parseEndpointName(name);
+          if (parsed[0] == _currentUserId) return;
+          if (parsed[0].isNotEmpty) _endpointUserIds[endpointId] = parsed[0];
+          _endpointNames[endpointId] = parsed[1];
+          discoveredDevices[endpointId] = parsed[1];
+
+          _considerConnecting(endpointId, userName);
+        },
+        onEndpointLost: (String? endpointId) {
+          if (endpointId != null) {
+            discoveredDevices.remove(endpointId);
+            _retryCounts.remove(endpointId);
+            update();
+          }
+        },
+      );
+      isDiscovering.value = result;
+    } catch (e) {
+      _log("Error starting discovery: $e");
+    }
+  }
+
+  void _considerConnecting(String endpointId, String localUserName) {
+    if (!_canConnectTo(endpointId)) return;
+
+    final String remoteUserId = _endpointUserIds[endpointId] ?? '';
+    final bool isInitiator =
+        remoteUserId.isEmpty || _currentUserId.compareTo(remoteUserId) < 0;
+
+    if (isInitiator) {
+      _requestConnection(localUserName, endpointId);
+      return;
+    }
+
+    Future.delayed(Duration(seconds: _fallbackConnectDelaySeconds), () {
+      if (_canConnectTo(endpointId)) {
+        _requestConnection(localUserName, endpointId);
+      }
+    });
+  }
+
+  bool _canConnectTo(String endpointId) {
+    if (isClosed) return false;
+    if (!discoveredDevices.containsKey(endpointId)) return false;
+    if (connectedEndpoints.containsKey(endpointId)) return false;
+    if (_pendingEndpoints.contains(endpointId)) return false;
+    if (_isBlockedUser(_endpointUserIds[endpointId] ?? '')) return false;
+    return true;
+  }
+
+  Future<void> _requestConnection(
+    String localUserName,
+    String endpointId,
+  ) async {
+    if (connectedEndpoints.containsKey(endpointId) ||
+        _pendingEndpoints.contains(endpointId)) {
+      return;
+    }
+
+    _pendingEndpoints.add(endpointId);
+
+    try {
+      await Nearby().requestConnection(
+        _encodeEndpointName(localUserName),
+        endpointId,
+        onConnectionInitiated: (id, info) => _onConnectionInitiated(id, info),
+        onConnectionResult: (id, status) {
+          _onConnectionResult(id, status);
+          if (status != Status.CONNECTED) {
+            _scheduleRetry(localUserName, id);
+          }
+        },
+        onDisconnected: (id) => _onDisconnected(id),
+      );
+    } catch (e) {
+      _pendingEndpoints.remove(endpointId);
+      _log("Error requesting connection: $e");
+      _scheduleRetry(localUserName, endpointId);
+    }
+  }
+
+  void _scheduleRetry(String localUserName, String endpointId) {
+    final int attempts = _retryCounts[endpointId] ?? 0;
+    if (attempts >= _maxConnectionRetries) return;
+    _retryCounts[endpointId] = attempts + 1;
+
+    Future.delayed(Duration(seconds: 3 * (attempts + 1)), () {
+      if (_canConnectTo(endpointId)) {
+        _requestConnection(localUserName, endpointId);
+      }
+    });
+  }
+
+  Future<void> _onConnectionInitiated(
+    String endpointId,
+    ConnectionInfo info,
+  ) async {
+    final parsed = _parseEndpointName(info.endpointName);
+    final String remoteUserId = parsed[0];
+
+    if (_isBlockedUser(remoteUserId)) {
+      _pendingEndpoints.remove(endpointId);
+      try {
+        await Nearby().rejectConnection(endpointId);
+      } catch (e) {
+        _log("Error rejecting connection: $e");
+      }
+      return;
+    }
+
+    _pendingEndpoints.add(endpointId);
+    if (remoteUserId.isNotEmpty) _endpointUserIds[endpointId] = remoteUserId;
+    _endpointNames[endpointId] = parsed[1];
+
+    try {
+      await Nearby().acceptConnection(
+        endpointId,
+        onPayLoadRecieved: (String endpointId, Payload payload) {
+          if (payload.type == PayloadType.BYTES && payload.bytes != null) {
+            _handleIncomingPayload(endpointId, payload.bytes!);
+          }
+        },
+      );
+    } catch (e) {
+      _pendingEndpoints.remove(endpointId);
+      _log("Error accepting connection: $e");
+    }
+  }
+
+  void _onConnectionResult(String endpointId, Status status) {
+    _pendingEndpoints.remove(endpointId);
+
+    if (status == Status.CONNECTED) {
+      _retryCounts.remove(endpointId);
+      connectedEndpoints[endpointId] =
+          _endpointNames[endpointId] ??
+          discoveredDevices[endpointId] ??
+          endpointId;
+      _sendHandshake(endpointId);
+      update();
+    } else {
+      connectedEndpoints.remove(endpointId);
+      update();
+    }
+  }
+
+  void _onDisconnected(String endpointId) {
+    connectedEndpoints.remove(endpointId);
+    _pendingEndpoints.remove(endpointId);
+
+    final bool routesChanged = _removeRoutesVia(endpointId);
+    update();
+
+    if (routesChanged) {
+      _broadcastRoutingTable();
+    }
   }
 
   void _sendHandshake(String endpointId) {
@@ -104,13 +376,124 @@ class MeshNetworkController extends GetxController {
     Uint8List bytes = Uint8List.fromList(
       utf8.encode(jsonEncode(handshakePacket)),
     );
-    Nearby().sendBytesPayload(endpointId, bytes);
+    _sendBytes(endpointId, bytes);
   }
 
-  void _bordCastRoutingTable({required String senderEndpointId}) {
-    List routesList = [];
+  String _encodeEndpointName(String name) {
+    final String shortName = name.length > _maxEndpointNameLength
+        ? name.substring(0, _maxEndpointNameLength)
+        : name;
+    return "$_currentUserId|$shortName";
+  }
+
+  List<String> _parseEndpointName(String raw) {
+    final int separator = raw.indexOf('|');
+    if (separator <= 0) return ['', raw];
+    return [raw.substring(0, separator), raw.substring(separator + 1)];
+  }
+
+  void _handleIncomingPayload(String senderEndpointId, Uint8List rawBytes) {
+    try {
+      final String? endpointUserId = _endpointUserIds[senderEndpointId];
+      if (endpointUserId != null && _isBlockedUser(endpointUserId)) return;
+
+      final String jsonString = utf8.decode(rawBytes);
+      final decoded = jsonDecode(jsonString);
+      if (decoded is! Map<String, dynamic>) return;
+
+      final Map<String, dynamic> packet = decoded;
+      final type = packet["type"];
+
+      if (type == "HANDSHAKE") {
+        _handleHandshake(senderEndpointId, packet);
+        return;
+      } else if (type == 'ROUTING_UPDATE') {
+        _processRoutingUpdate(senderEndpointId, packet);
+        return;
+      }
+
+      final messageId = packet['messageId'];
+      final targetUserId = packet['targetId'];
+      final senderId = packet['senderId'];
+      final body = packet['body'];
+
+      if (messageId is! String ||
+          targetUserId is! String ||
+          senderId is! String ||
+          body is! String) {
+        return;
+      }
+
+      if (_isBlockedUser(senderId)) return;
+
+      if (!_rememberMessageId(messageId)) {
+        return;
+      }
+
+      final bool isForLoraModule = packet['isLora'] == true;
+      final String currentUserId = _currentUserId;
+
+      if (targetUserId == currentUserId) {
+        _storeIncomingMessage(packet);
+        return;
+      }
+
+      bool isConnectedToESP32 = true;
+      if (isConnectedToESP32 && isForLoraModule) {
+        // if ESP32 is connected and if the message is for LORA Gateway
+        sendToEsp32LoraGateway(jsonString);
+      } else {
+        // if the message is for another just hop and push forword
+        relayMessageToMesh(senderEndpointId, packet);
+      }
+    } catch (e) {
+      _log("Dropped invalid payload from $senderEndpointId: $e");
+    }
+  }
+
+  void _handleHandshake(String senderEndpointId, Map<String, dynamic> packet) {
+    final remoteUserId = packet["userId"];
+    final remoteUserName = packet["userName"];
+
+    if (remoteUserId is! String ||
+        remoteUserId.isEmpty ||
+        remoteUserId == _currentUserId) {
+      return;
+    }
+
+    if (_isBlockedUser(remoteUserId)) {
+      _disconnectEndpoint(senderEndpointId);
+      return;
+    }
+
+    final String name = remoteUserName is String
+        ? remoteUserName
+        : remoteUserId;
+
+    _endpointUserIds[senderEndpointId] = remoteUserId;
+    _endpointNames[senderEndpointId] = name;
+    knownUsers[remoteUserId] = name;
+    connectedEndpoints[senderEndpointId] = name;
+
+    _addDirectNeighbor(senderEndpointId, remoteUserId);
+    _sendRoutingTableTo(senderEndpointId);
+    _broadcastRoutingTable(exceptEndpointId: senderEndpointId);
+    update();
+  }
+
+  void _addDirectNeighbor(String endpointId, String userId) {
+    routingTable[userId] = RouteEntry(
+      destinationId: userId,
+      nextHopId: endpointId,
+      hopCount: 1,
+    );
+  }
+
+  void _sendRoutingTableTo(String endpointId) {
+    final List<Map<String, dynamic>> routesList = [];
 
     routingTable.forEach((desId, entry) {
+      if (entry.nextHopId == endpointId) return;
       routesList.add({
         "destinationId": entry.destinationId,
         "hopCount": entry.hopCount,
@@ -127,31 +510,51 @@ class MeshNetworkController extends GetxController {
       utf8.encode(jsonEncode(routingPacket)),
     );
 
-    connectedEndpoints.forEach((endpointId, _) {
-      if (endpointId != senderEndpointId) {
-        Nearby().sendBytesPayload(endpointId, bytes);
-      }
-    });
+    _sendBytes(endpointId, bytes);
   }
 
-  void _processRoutingUpdate( String senderEndpointId, Map<String, dynamic> packet) {
-    String senderUserId = packet['senderUserId'];
-    List<dynamic> receivedRoutes = packet['routes'];
+  void _broadcastRoutingTable({String? exceptEndpointId}) {
+    for (final endpointId in connectedEndpoints.keys.toList()) {
+      if (endpointId != exceptEndpointId) {
+        _sendRoutingTableTo(endpointId);
+      }
+    }
+  }
+
+  void _processRoutingUpdate(
+    String senderEndpointId,
+    Map<String, dynamic> packet,
+  ) {
+    final routes = packet['routes'];
+    if (routes is! List) return;
 
     bool isTableChanged = false;
+    final Set<String> advertisedDestinations = {};
 
-    for (var route in receivedRoutes) {
-      String destId = route['destinationId'];
-      int incomingHops = route['hopCount'];
+    for (final route in routes) {
+      if (route is! Map) continue;
 
-      String myUserId = _currentUserId;
-      if (destId == myUserId) continue;
+      final destId = route['destinationId'];
+      final incomingHops = route['hopCount'];
+      if (destId is! String || incomingHops is! int) continue;
+      if (destId == _currentUserId) continue;
 
-      int senderHopToMe = routingTable[senderUserId]?.hopCount ?? 1;
-      int calculatedHops = incomingHops + 1;
+      final int calculatedHops = incomingHops + 1;
+      if (calculatedHops > _maxHops) continue;
 
-      if (!routingTable.containsKey(destId) ||
-          routingTable[destId]!.hopCount > calculatedHops) {
+      advertisedDestinations.add(destId);
+
+      final RouteEntry? existing = routingTable[destId];
+      bool shouldReplace;
+      if (existing == null) {
+        shouldReplace = true;
+      } else if (existing.nextHopId == senderEndpointId) {
+        shouldReplace = existing.hopCount != calculatedHops;
+      } else {
+        shouldReplace = existing.hopCount > calculatedHops;
+      }
+
+      if (shouldReplace) {
         routingTable[destId] = RouteEntry(
           destinationId: destId,
           nextHopId: senderEndpointId,
@@ -161,154 +564,241 @@ class MeshNetworkController extends GetxController {
       }
     }
 
+    final List<String> staleDestinations = routingTable.entries
+        .where(
+          (e) =>
+              e.value.nextHopId == senderEndpointId &&
+              !advertisedDestinations.contains(e.key),
+        )
+        .map((e) => e.key)
+        .toList();
+
+    for (final destId in staleDestinations) {
+      routingTable.remove(destId);
+      isTableChanged = true;
+    }
+
     if (isTableChanged) {
-      _bordCastRoutingTable(senderEndpointId: senderEndpointId);
+      _broadcastRoutingTable(exceptEndpointId: senderEndpointId);
       update();
     }
   }
 
-  void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
-    Nearby().acceptConnection(
-      endpointId,
-      onPayLoadRecieved: (String endpointId, Payload payload) {
-        if (payload.type == PayloadType.BYTES && payload.bytes != null) {
-          String message = String.fromCharCodes(payload.bytes!);
-          print("Received mesh message: $message");
-          _handleIncomingPayload(endpointId, payload.bytes!);
-        }
-      },
+  bool _removeRoutesVia(String endpointId) {
+    final List<String> destinations = routingTable.entries
+        .where((e) => e.value.nextHopId == endpointId)
+        .map((e) => e.key)
+        .toList();
+
+    for (final destId in destinations) {
+      routingTable.remove(destId);
+    }
+    return destinations.isNotEmpty;
+  }
+
+  void _startRouteRefresh() {
+    _routeRefreshTimer?.cancel();
+    _routeRefreshTimer = Timer.periodic(
+      Duration(seconds: _routeRefreshSeconds),
+      (_) => _broadcastRoutingTable(),
     );
   }
 
-  Future<void> startAdvertising(String userName) async {
+  void _storeIncomingMessage(Map<String, dynamic> packet) {
+    final Map<String, dynamic> message = {
+      "messageId": packet['messageId'],
+      "senderId": packet['senderId'],
+      "targetId": packet['targetId'],
+      "body": packet['body'],
+      "hopCount": packet['hopCount'] is int ? packet['hopCount'] : 0,
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+      "isMine": false,
+    };
+
+    chatMessages.add(message);
+    onMessageReceived?.call(message);
+    update();
+  }
+
+  void relayMessageToMesh(
+    String originEndpointId,
+    Map<String, dynamic> packet,
+  ) {
+    final int ttl = packet['ttl'] is int ? packet['ttl'] as int : 0;
+    if (ttl <= 1) return;
+
+    final int hopCount = packet['hopCount'] is int
+        ? packet['hopCount'] as int
+        : 0;
+
+    final Map<String, dynamic> relayed = Map<String, dynamic>.from(packet);
+    relayed['ttl'] = ttl - 1;
+    relayed['hopCount'] = hopCount + 1;
+
+    _forwardPacket(relayed, originEndpointId: originEndpointId);
+  }
+
+  int _forwardPacket(Map<String, dynamic> packet, {String? originEndpointId}) {
+    final Uint8List bytes = Uint8List.fromList(utf8.encode(jsonEncode(packet)));
+    if (bytes.length > _maxPayloadBytes) return 0;
+
+    final RouteEntry? route = routingTable[packet['targetId']];
+    if (route != null &&
+        route.nextHopId != 'SELF' &&
+        route.nextHopId != originEndpointId &&
+        connectedEndpoints.containsKey(route.nextHopId)) {
+      _sendBytes(route.nextHopId, bytes);
+      return 1;
+    }
+
+    int sentCount = 0;
+    for (final endpointId in connectedEndpoints.keys.toList()) {
+      if (endpointId != originEndpointId) {
+        _sendBytes(endpointId, bytes);
+        sentCount++;
+      }
+    }
+    return sentCount;
+  }
+
+  void sendToEsp32LoraGateway(String payloadString) {
+    _log("Forwarded to LoRa via ESP32");
+  }
+
+  Future<void> _sendBytes(String endpointId, Uint8List bytes) async {
     try {
-      bool result = await Nearby().startAdvertising(
-        userName,
-        strategy,
-        serviceId: serviceId,
-        onConnectionInitiated: (String endpointId, ConnectionInfo info) {
-          _onConnectionInitiated(endpointId, info);
-        },
-        onConnectionResult: (String endpointId, Status status) {
-          if (status == Status.CONNECTED) {
-            connectedEndpoints[endpointId] = endpointId;
-            _sendHandshake(endpointId);
-            update();
-          } else {
-            connectedEndpoints.remove(endpointId);
-          }
-        },
-        onDisconnected: (String endpointId) {
-          connectedEndpoints.remove(endpointId);
-          update();
-        },
-      );
-      isAdvertising.value = result;
+      await Nearby().sendBytesPayload(endpointId, bytes);
     } catch (e) {
-      print("Error starting advertising: $e");
+      _log("Error sending to $endpointId: $e");
     }
   }
 
-  Future<void> startDiscovery(String userName) async {
+  bool broadcastMessage(String targetUserId, String messageBody, bool isLora) {
+    if (connectedEndpoints.isEmpty) return false;
+
+    final String messageId = _generateMessageId();
+
+    Map<String, dynamic> packet = {
+      "isLora": isLora,
+      "messageId": messageId,
+      "senderId": _currentUserId,
+      "targetId": targetUserId,
+      "body": messageBody,
+      "hopCount": 0,
+      "ttl": _defaultTtl,
+    };
+
+    _rememberMessageId(messageId);
+
+    final int sentCount = _forwardPacket(packet);
+    if (sentCount == 0) return false;
+
+    chatMessages.add({
+      "messageId": messageId,
+      "senderId": _currentUserId,
+      "targetId": targetUserId,
+      "body": messageBody,
+      "hopCount": 0,
+      "timestamp": DateTime.now().millisecondsSinceEpoch,
+      "isMine": true,
+    });
+    update();
+    return true;
+  }
+
+  String _generateMessageId() {
+    _messageCounter++;
+    return "${_currentUserId}_${DateTime.now().microsecondsSinceEpoch}_$_messageCounter";
+  }
+
+  bool _rememberMessageId(String messageId) {
+    if (_processedMessageIds.contains(messageId)) return false;
+
+    _processedMessageIds.add(messageId);
+    if (_processedMessageIds.length > _maxCacheSize) {
+      _processedMessageIds.remove(_processedMessageIds.first);
+    }
+    return true;
+  }
+
+  void manualConnectToDevice(String endpointId) {
+    if (_isBlockedUser(_endpointUserIds[endpointId] ?? '')) return;
+
+    _retryCounts.remove(endpointId);
+    _requestConnection(_userName, endpointId);
+  }
+
+  void blockDevice(String endpointId) {
+    final String? userId = _endpointUserIds[endpointId];
+    if (userId == null || userId.isEmpty) return;
+
+    if (!blockedDevices.contains(userId)) {
+      blockedDevices.add(userId);
+    }
+
+    final List<String> endpointsOfUser = _endpointUserIds.entries
+        .where(
+          (e) => e.value == userId && connectedEndpoints.containsKey(e.key),
+        )
+        .map((e) => e.key)
+        .toList();
+
+    for (final id in endpointsOfUser) {
+      _disconnectEndpoint(id);
+    }
+
+    update();
+  }
+
+  void unblockDevice(String userIdOrEndpointId) {
+    String userId = userIdOrEndpointId;
+    if (!blockedDevices.contains(userId)) {
+      userId = _endpointUserIds[userIdOrEndpointId] ?? userIdOrEndpointId;
+    }
+
+    blockedDevices.remove(userId);
+
+    final List<String> endpointsOfUser = _endpointUserIds.entries
+        .where((e) => e.value == userId)
+        .map((e) => e.key)
+        .toList();
+
+    for (final endpointId in endpointsOfUser) {
+      _considerConnecting(endpointId, _userName);
+    }
+
+    update();
+  }
+
+  Future<void> _disconnectEndpoint(String endpointId) async {
     try {
-      bool result = await Nearby().startDiscovery(
-        userName,
-        strategy,
-        serviceId: serviceId,
-        onEndpointFound: (String endpointId, String name, String serviceId) {
-          discoveredDevices[endpointId] = name;
-
-          if (!blockedDevices.contains(endpointId)) {
-            _requestConnection(userName, endpointId);
-          } else {
-            print("Device $name is blocked, skipping connection");
-          }
-        },
-        onEndpointLost: (String? endpointId) {
-          if (endpointId != null) {
-            discoveredDevices.remove(endpointId);
-            connectedEndpoints.remove(endpointId);
-            update();
-          }
-        },
-      );
-      isDiscovering.value = result;
+      await Nearby().disconnectFromEndpoint(endpointId);
     } catch (e) {
-      print("Error starting discovery: $e");
+      _log("Error disconnecting $endpointId: $e");
     }
+    _onDisconnected(endpointId);
   }
 
-  void _requestConnection(String localUserName, String endpointId) async {
-    try {
-      await Nearby().requestConnection(
-        localUserName,
-        endpointId,
-        onConnectionInitiated: (id, info) => _onConnectionInitiated(id, info),
-        onConnectionResult: (id, status) {
-          if (status == Status.CONNECTED) {
-            connectedEndpoints[id] = endpointId;
-            _sendHandshake(endpointId);
-            update();
-          }
-        },
-        onDisconnected: (id) {
-          connectedEndpoints.remove(id);
-          update();
-        },
-      );
-    } catch (e) {
-      print("Error requesting connection: $e");
-    }
+  bool _isBlockedUser(String userId) {
+    return userId.isNotEmpty && blockedDevices.contains(userId);
   }
 
-  void startMeshNode(String localUserName) async {
-    await startAdvertising(localUserName);
-    await startDiscovery(localUserName);
-  }
-
-  Future<void> initMeshNetwork() async {
-    bool hasPermission = await checkAndRequestPermissions();
-    if (hasPermission) {
-      await Nearby().stopAdvertising();
-      await Nearby().stopDiscovery();
-      await Nearby().stopAllEndpoints();
-
-      await Future.delayed(Duration(milliseconds: 500));
-
-      // add current user id to the routing table
-      routingTable[_currentUserId] = RouteEntry(
-        destinationId: _currentUserId,
-        nextHopId: 'SELF',
-        hopCount: 0,
-      );
-
-      startMeshNode(_userName);
-    } else {
-      Get.snackbar(
-        "Permission Required",
-        "Bluetooth, Location & Nearby permissions are required for offline mesh.",
-      );
-    }
-  }
-
-  // Request a single permission and update its state
   Future<void> requestSinglePermission(Permission permission) async {
+    final int sdk = await _getSdkInt();
+
+    final bool isNewBluetooth =
+        permission == Permission.bluetoothScan ||
+        permission == Permission.bluetoothAdvertise ||
+        permission == Permission.bluetoothConnect;
+    final bool isNearbyWifi = permission == Permission.nearbyWifiDevices;
+
+    if ((isNewBluetooth && sdk < 31) || (isNearbyWifi && sdk < 33)) {
+      await checkPermissions();
+      return;
+    }
+
     PermissionStatus status = await permission.request();
 
-    // Update the specific state
-    if (permission == Permission.bluetoothScan) {
-      bluetoothScanGranted.value = status.isGranted;
-    } else if (permission == Permission.bluetoothAdvertise) {
-      bluetoothAdvertiseGranted.value = status.isGranted;
-    } else if (permission == Permission.bluetoothConnect) {
-      bluetoothConnectGranted.value = status.isGranted;
-    } else if (permission == Permission.location) {
-      locationGranted.value = status.isGranted;
-    } else if (permission == Permission.nearbyWifiDevices) {
-      nearbyWifiGranted.value = status.isGranted;
-    }
-
-    // Handle permanent denial
     if (status.isPermanentlyDenied) {
       Get.dialog(
         AlertDialog(
@@ -318,7 +808,7 @@ class MeshNetworkController extends GetxController {
             TextButton(onPressed: () => Get.back(), child: Text("Cancel")),
             TextButton(
               onPressed: () {
-                openAppSettings(); // Opens system settings
+                openAppSettings();
                 Get.back();
               },
               child: Text("Open Settings"),
@@ -328,19 +818,15 @@ class MeshNetworkController extends GetxController {
       );
     }
 
-    // Re-check if all permissions are granted
-    await checkAndRequestPermissions();
+    await checkPermissions();
   }
 
-  // Request to ignore battery optimization
   Future<void> requestIgnoreBatteryOptimization() async {
     PermissionStatus status = await Permission.ignoreBatteryOptimizations
         .request();
     batteryOptimizationDisabled.value = status.isGranted;
 
-    if (status.isDenied) {
-      // User denied ---> show explanation
-
+    if (status.isDenied || status.isPermanentlyDenied) {
       Get.dialog(
         AlertDialog(
           title: Text("Battery Optimization"),
@@ -363,105 +849,10 @@ class MeshNetworkController extends GetxController {
     }
   }
 
-  void _handleIncomingPayload(String senderEndpointId, Uint8List rawBytes) {
-    String jsonString = utf8.decode(rawBytes);
-    Map<String, dynamic> packet = jsonDecode(jsonString);
-    final type = packet["type"];
-
-    if (type == "HANDSHAKE") {
-      final remoteUserId = packet["userId"];
-      _addDirectNeighbor(senderEndpointId, remoteUserId);
-      _bordCastRoutingTable(senderEndpointId: senderEndpointId);
-      update();
-      return;
-    } else if (type == 'ROUTING_UPDATE') {
-      _processRoutingUpdate(senderEndpointId, packet);
-      return;
-    }
-
-    String messageId = packet['messageId'];
-
-    if (_processedMessageIds.contains(messageId)) {
-      return;
-    }
-
-    _processedMessageIds.add(messageId);
-    if (_processedMessageIds.length > _maxCacheSize) {
-      _processedMessageIds.remove(_processedMessageIds.first);
-    }
-
-    String targetUserId = packet['targetId'];
-    bool isForLoraModule = packet['isLora'];
-    String currentUserId = _currentUserId; // current user id
-
-    if (targetUserId == currentUserId) {
-      print("Message Received for ME: ${packet['body']}");
-      // TODO: Nee to add the message in hive and in ui
-      return;
-    }
-
-    bool isConnectedToESP32 = true;
-    if (isConnectedToESP32 && isForLoraModule) {
-      // if ESP32 is connected and if the message is for LORA Gateway
-      sendToEsp32LoraGateway(jsonString);
-    } else {
-      // if the message is for another just hop and push forword
-      relayMessageToMesh(senderEndpointId, rawBytes);
-    }
-  }
-
-  // mesh to all connected phones
-  void relayMessageToMesh(String originEndpointId, Uint8List rawBytes) {
-    Uint8List safeBytes = Uint8List.fromList(rawBytes);
-
-    connectedEndpoints.forEach((endpointId, name) {
-      if (endpointId != originEndpointId) {
-        Nearby().sendBytesPayload(endpointId, safeBytes);
-      }
-    });
-  }
-
-  void sendToEsp32LoraGateway(String payloadString) {
-    print("Forwarded to LoRa via ESP32: $payloadString");
-  }
-
-  void broadcastMessage(String targetUserId, String messageBody, bool isLora) {
-    Map<String, dynamic> packet = {
-      "isLora": isLora,
-      "messageId": DateTime.now().millisecondsSinceEpoch.toString(),
-      "senderId": _homeController.userProfileData.value!.userId,
-      "targetId": targetUserId,
-      "body": messageBody,
-      "hopCount": 0,
-    };
-
-    // convert sting to byte for standard Uint8List
-    List<int> encodedBytes = utf8.encode(jsonEncode(packet));
-    Uint8List bytes = Uint8List.fromList(encodedBytes);
-
-    connectedEndpoints.forEach((endpointId, name) {
-      Nearby().sendBytesPayload(endpointId, bytes);
-    });
-  }
-
-  void blockDevice(String endpointId) {
-    if (!blockedDevices.contains(endpointId)) {
-      blockedDevices.add(endpointId);
-
-      if (connectedEndpoints.containsKey(endpointId)) {
-        Nearby().disconnectFromEndpoint(endpointId);
-        connectedEndpoints.remove(endpointId);
-      }
-    }
-  }
-
-  void unblockDevice(String endpointId) {
-    blockedDevices.remove(endpointId);
-  }
-
-  void manualConnectToDevice(String endpointId) {
-    String userName = _userName;
-    _requestConnection(userName, endpointId);
+  @override
+  void onInit() {
+    checkPermissions();
+    super.onInit();
   }
 
   @override
@@ -469,6 +860,29 @@ class MeshNetworkController extends GetxController {
     Nearby().stopAdvertising();
     Nearby().stopDiscovery();
     Nearby().stopAllEndpoints();
+    _resetState(notify: false);
     super.onClose();
+  }
+
+  void _resetState({bool notify = true}) {
+    _routeRefreshTimer?.cancel();
+    _routeRefreshTimer = null;
+
+    routingTable.clear();
+    connectedEndpoints.clear();
+    discoveredDevices.clear();
+    _pendingEndpoints.clear();
+    _retryCounts.clear();
+    _endpointUserIds.clear();
+    _endpointNames.clear();
+
+    isAdvertising.value = false;
+    isDiscovering.value = false;
+
+    if (notify) update();
+  }
+
+  void _log(String message) {
+    if (kDebugMode) debugPrint("[Mesh] $message");
   }
 }
