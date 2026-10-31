@@ -8,6 +8,8 @@ import 'package:location/location.dart' as loc;
 import 'package:nearby_connections/nearby_connections.dart';
 import 'package:permission_handler/permission_handler.dart';
 
+import '../models/route_entry.dart';
+
 class MeshNetworkController extends GetxController {
   @override
   void onInit() {
@@ -16,6 +18,9 @@ class MeshNetworkController extends GetxController {
   }
 
   HomeController get _homeController => Get.find<HomeController>();
+
+  late final _currentUserId = _homeController.userProfileData.value!.userId;
+  late final _userName = _homeController.userProfileData.value!.name;
 
   final String serviceId = "com.hoptalk.mesh";
   final Strategy strategy = Strategy.P2P_CLUSTER;
@@ -36,8 +41,11 @@ class MeshNetworkController extends GetxController {
   var discoveredDevices = <String, String>{}.obs; // discovered devices
   var blockedDevices = <String>[].obs; // blocked devices
 
-  final Set<String> _processedMessageIds = {};
+  final Set<String> _processedMessageIds = {}; // cached message
   final int _maxCacheSize = 200;
+
+  final Map<String, RouteEntry> routingTable =
+      {}; // Routing table as like phonebook
 
   Future<bool> checkAndRequestPermissions() async {
     bluetoothScanGranted.value = await Permission.bluetoothScan.isGranted;
@@ -78,15 +86,95 @@ class MeshNetworkController extends GetxController {
     return isPermissionsGranted.value;
   }
 
+  void _addDirectNeighbor(String endpointId, String userId) {
+    routingTable[userId] = RouteEntry(
+      destinationId: userId,
+      nextHopId: endpointId,
+      hopCount: 1,
+    );
+  }
+
+  void _sendHandshake(String endpointId) {
+    Map<String, dynamic> handshakePacket = {
+      "type": "HANDSHAKE",
+      "userId": _currentUserId,
+      "userName": _userName,
+    };
+
+    Uint8List bytes = Uint8List.fromList(
+      utf8.encode(jsonEncode(handshakePacket)),
+    );
+    Nearby().sendBytesPayload(endpointId, bytes);
+  }
+
+  void _bordCastRoutingTable({required String senderEndpointId}) {
+    List routesList = [];
+
+    routingTable.forEach((desId, entry) {
+      routesList.add({
+        "destinationId": entry.destinationId,
+        "hopCount": entry.hopCount,
+      });
+    });
+
+    Map<String, dynamic> routingPacket = {
+      "type": "ROUTING_UPDATE",
+      "senderUserId": _currentUserId,
+      "routes": routesList,
+    };
+
+    Uint8List bytes = Uint8List.fromList(
+      utf8.encode(jsonEncode(routingPacket)),
+    );
+
+    connectedEndpoints.forEach((endpointId, _) {
+      if (endpointId != senderEndpointId) {
+        Nearby().sendBytesPayload(endpointId, bytes);
+      }
+    });
+  }
+
+  void _processRoutingUpdate( String senderEndpointId, Map<String, dynamic> packet) {
+    String senderUserId = packet['senderUserId'];
+    List<dynamic> receivedRoutes = packet['routes'];
+
+    bool isTableChanged = false;
+
+    for (var route in receivedRoutes) {
+      String destId = route['destinationId'];
+      int incomingHops = route['hopCount'];
+
+      String myUserId = _currentUserId;
+      if (destId == myUserId) continue;
+
+      int senderHopToMe = routingTable[senderUserId]?.hopCount ?? 1;
+      int calculatedHops = incomingHops + 1;
+
+      if (!routingTable.containsKey(destId) ||
+          routingTable[destId]!.hopCount > calculatedHops) {
+        routingTable[destId] = RouteEntry(
+          destinationId: destId,
+          nextHopId: senderEndpointId,
+          hopCount: calculatedHops,
+        );
+        isTableChanged = true;
+      }
+    }
+
+    if (isTableChanged) {
+      _bordCastRoutingTable(senderEndpointId: senderEndpointId);
+      update();
+    }
+  }
+
   void _onConnectionInitiated(String endpointId, ConnectionInfo info) {
     Nearby().acceptConnection(
       endpointId,
       onPayLoadRecieved: (String endpointId, Payload payload) {
-        // waiting for receive messages
-        if (payload.type == PayloadType.BYTES) {
+        if (payload.type == PayloadType.BYTES && payload.bytes != null) {
           String message = String.fromCharCodes(payload.bytes!);
           print("Received mesh message: $message");
-          // hive database pass
+          _handleIncomingPayload(endpointId, payload.bytes!);
         }
       },
     );
@@ -104,6 +192,7 @@ class MeshNetworkController extends GetxController {
         onConnectionResult: (String endpointId, Status status) {
           if (status == Status.CONNECTED) {
             connectedEndpoints[endpointId] = endpointId;
+            _sendHandshake(endpointId);
             update();
           } else {
             connectedEndpoints.remove(endpointId);
@@ -158,6 +247,7 @@ class MeshNetworkController extends GetxController {
         onConnectionResult: (id, status) {
           if (status == Status.CONNECTED) {
             connectedEndpoints[id] = endpointId;
+            _sendHandshake(endpointId);
             update();
           }
         },
@@ -185,7 +275,14 @@ class MeshNetworkController extends GetxController {
 
       await Future.delayed(Duration(milliseconds: 500));
 
-      startMeshNode(_homeController.userProfileData.value!.name);
+      // add current user id to the routing table
+      routingTable[_currentUserId] = RouteEntry(
+        destinationId: _currentUserId,
+        nextHopId: 'SELF',
+        hopCount: 0,
+      );
+
+      startMeshNode(_userName);
     } else {
       Get.snackbar(
         "Permission Required",
@@ -269,6 +366,18 @@ class MeshNetworkController extends GetxController {
   void _handleIncomingPayload(String senderEndpointId, Uint8List rawBytes) {
     String jsonString = utf8.decode(rawBytes);
     Map<String, dynamic> packet = jsonDecode(jsonString);
+    final type = packet["type"];
+
+    if (type == "HANDSHAKE") {
+      final remoteUserId = packet["userId"];
+      _addDirectNeighbor(senderEndpointId, remoteUserId);
+      _bordCastRoutingTable(senderEndpointId: senderEndpointId);
+      update();
+      return;
+    } else if (type == 'ROUTING_UPDATE') {
+      _processRoutingUpdate(senderEndpointId, packet);
+      return;
+    }
 
     String messageId = packet['messageId'];
 
@@ -283,8 +392,7 @@ class MeshNetworkController extends GetxController {
 
     String targetUserId = packet['targetId'];
     bool isForLoraModule = packet['isLora'];
-    String currentUserId =
-        _homeController.userProfileData.value!.userId; // current user id
+    String currentUserId = _currentUserId; // current user id
 
     if (targetUserId == currentUserId) {
       print("Message Received for ME: ${packet['body']}");
@@ -312,7 +420,6 @@ class MeshNetworkController extends GetxController {
       }
     });
   }
-
 
   void sendToEsp32LoraGateway(String payloadString) {
     print("Forwarded to LoRa via ESP32: $payloadString");
@@ -353,7 +460,7 @@ class MeshNetworkController extends GetxController {
   }
 
   void manualConnectToDevice(String endpointId) {
-    String userName = _homeController.userProfileData.value!.name;
+    String userName = _userName;
     _requestConnection(userName, endpointId);
   }
 
