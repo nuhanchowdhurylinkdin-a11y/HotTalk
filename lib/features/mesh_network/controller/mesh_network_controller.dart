@@ -438,7 +438,7 @@ class MeshNetworkController extends GetxController {
         return;
       }
 
-      bool isConnectedToESP32 = true;
+      bool isConnectedToESP32 = false;
       if (isConnectedToESP32 && isForLoraModule) {
         // if ESP32 is connected and if the message is for LORA Gateway
         sendToEsp32LoraGateway(jsonString);
